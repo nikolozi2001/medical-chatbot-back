@@ -35,6 +35,20 @@ const genAI = new GoogleGenerativeAI(process.env.GOOGLE_GEN_AI_KEY);
 const activeOperators = new Set();
 const activeClients = new Map(); // clientId -> {socket, operatorId}
 
+// Add a utility function to track recently processed messages
+const recentMessages = new Map(); // messageId -> timestamp
+const MESSAGE_TTL = 10000; // 10 seconds
+
+// Clean up old messages periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [messageId, timestamp] of recentMessages.entries()) {
+    if (now - timestamp > MESSAGE_TTL) {
+      recentMessages.delete(messageId);
+    }
+  }
+}, 30000); // Clean every 30 seconds
+
 // Socket.io connection handling
 io.on('connection', (socket) => {
   console.log('New socket connection:', socket.id);
@@ -50,16 +64,19 @@ io.on('connection', (socket) => {
   // Operator connects to the system
   socket.on('operator:connect', (operatorData) => {
     const operatorId = operatorData.id || socket.id;
-    console.log('Operator connected:', operatorId);
+    const operatorName = operatorData.name || 'Operator';
+    console.log(`Operator connected: ${operatorId} (${operatorName})`);
     
     socket.join('operators');
     activeOperators.add(operatorId);
     socket.operatorId = operatorId;
+    socket.operatorName = operatorName;
     
     // Inform the operator about current active clients
-    socket.emit('clients:list', Array.from(activeClients.keys()).map(clientId => ({
-      id: clientId,
-      hasOperator: !!activeClients.get(clientId).operatorId
+    socket.emit('clients:list', Array.from(activeClients.entries()).map(([id, client]) => ({
+      id,
+      name: client.name,
+      hasOperator: !!client.operatorId
     })));
     
     // Broadcast to all clients that an operator is available
@@ -69,21 +86,73 @@ io.on('connection', (socket) => {
   // Client connects to the system
   socket.on('client:connect', (clientData) => {
     const clientId = clientData.id || socket.id;
-    console.log('Client connected:', clientId);
+    const clientName = clientData.name || 'Guest';
+    console.log(`Client connected: ${clientId} (${clientName})`);
     
     socket.join('clients');
     socket.clientId = clientId;
+    socket.clientName = clientName;
     
-    activeClients.set(clientId, { 
-      socket: socket.id,
-      operatorId: null 
-    });
-    
-    // Notify operators about the new client
-    io.to('operators').emit('client:new', { id: clientId });
+    // Check if this client already exists and update socket ID
+    if (activeClients.has(clientId)) {
+      const existingClient = activeClients.get(clientId);
+      console.log(`Client ${clientId} reconnected, updating socket ID from ${existingClient.socket} to ${socket.id}`);
+      
+      // Update the socket ID but preserve operator assignment and name
+      activeClients.set(clientId, { 
+        socket: socket.id,
+        operatorId: existingClient.operatorId,
+        name: clientName || existingClient.name,
+        status: 'connected',
+        reconnectedAt: new Date().toISOString()
+      });
+      
+      // Notify operators about reconnection with preserved state
+      io.to('operators').emit('client:reconnected', { 
+        id: clientId, 
+        name: clientName,
+        hasOperator: !!existingClient.operatorId,
+        status: 'connected'
+      });
+      
+      // If client had an operator, re-establish the connection
+      if (existingClient.operatorId) {
+        io.to(socket.id).emit('chat:accepted', { operatorId: existingClient.operatorId });
+      }
+    } else {
+      // Register new client
+      activeClients.set(clientId, { 
+        socket: socket.id,
+        operatorId: null,
+        name: clientName,
+        status: 'connected',
+        connectedAt: new Date().toISOString()
+      });
+      
+      // Notify operators about the new client
+      io.to('operators').emit('client:new', { 
+        id: clientId,
+        name: clientName,
+        hasOperator: false,
+        status: 'connected'
+      });
+    }
     
     // Let the client know if operators are available
     socket.emit('operator:status', { available: activeOperators.size > 0 });
+  });
+  
+  // Client leaves chat explicitly
+  socket.on('client:leave', ({ clientId }) => {
+    console.log(`Client ${clientId} explicitly left the chat`);
+    
+    if (activeClients.has(clientId)) {
+      const client = activeClients.get(clientId);
+      if (client.socket === socket.id) {
+        activeClients.delete(clientId);
+        io.to('operators').emit('client:left', { id: clientId });
+      }
+    }
   });
   
   // Operator accepts a client chat
@@ -97,6 +166,12 @@ io.on('connection', (socket) => {
       client.operatorId = socket.operatorId;
       activeClients.set(clientId, client);
       
+      // Confirm to the operator that the client is accepted
+      socket.emit('client:accepted', { 
+        id: clientId,
+        status: 'accepted' 
+      });
+      
       // Notify the client they've been accepted
       io.to(client.socket).emit('chat:accepted', { operatorId: socket.operatorId });
       
@@ -105,56 +180,203 @@ io.on('connection', (socket) => {
         id: clientId,
         hasOperator: true
       });
+    } else {
+      // If client not found, send error to operator
+      socket.emit('error', { message: 'Client not found or no longer connected' });
     }
   });
   
-  // Message handling
-  socket.on('message:send', ({ text, to, type = 'text' }) => {
+  // Message handling with deduplication
+  socket.on('message:send', ({ text, to, messageId = Date.now(), type = 'text', name }) => {
     console.log(`Message from ${socket.id} to ${to}: ${text}`);
     
-    // From operator to client
-    if (socket.operatorId && activeClients.has(to)) {
-      const client = activeClients.get(to);
-      io.to(client.socket).emit('message:received', {
-        text,
-        from: socket.operatorId,
-        type,
-        timestamp: new Date().toISOString()
-      });
+    // Check if we've seen this message recently
+    if (messageId && recentMessages.has(messageId)) {
+      console.log(`Ignoring duplicate message: ${messageId}`);
+      return;
     }
     
+    // Track this message to prevent duplicates
+    if (messageId) {
+      recentMessages.set(messageId, Date.now());
+    }
+    
+    // From operator to client
+    if (socket.operatorId && to) {
+      const client = activeClients.get(to);
+      if (client && client.socket) {
+        console.log(`Sending message from operator ${socket.operatorId} to client ${to}`);
+        
+        // Ensure we set the operatorId in the client data to maintain the connection
+        client.operatorId = socket.operatorId;
+        activeClients.set(to, client);
+        
+        io.to(client.socket).emit('message:received', {
+          text,
+          from: socket.operatorId,
+          name: name || socket.operatorName || 'ოპერატორი',
+          type,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        // Client not found or disconnected
+        socket.emit('error', { 
+          message: 'Client disconnected or not found',
+          clientId: to
+        });
+      }
+    }
     // From client to operator
     else if (socket.clientId) {
       const client = activeClients.get(socket.clientId);
       if (client && client.operatorId) {
+        console.log(`Sending message from client ${socket.clientId} to operators`);
+        
+        // Ensure the client doesn't lose its operator assignment
         io.to('operators').emit('message:received', {
           text,
           from: socket.clientId,
+          name: name || socket.clientName || client.name || 'გესტი',
           type,
           timestamp: new Date().toISOString()
         });
+      } else {
+        // No operator assigned
+        socket.emit('error', { message: 'No operator assigned to this chat yet' });
       }
     }
   });
   
-  // Handle disconnections
+  // Handle disconnections with improved persistence
   socket.on('disconnect', () => {
     console.log('Disconnected:', socket.id);
     
     // Operator disconnect
     if (socket.operatorId) {
-      activeOperators.delete(socket.operatorId);
-      
-      // Notify clients if no operators are left
-      if (activeOperators.size === 0) {
-        io.to('clients').emit('operator:status', { available: false });
-      }
+      // Don't immediately remove the operator, give time for potential reconnect
+      setTimeout(() => {
+        if (!io.sockets.adapter.rooms.has(socket.id)) {
+          activeOperators.delete(socket.operatorId);
+          
+          // Notify clients if no operators are left
+          if (activeOperators.size === 0) {
+            io.to('clients').emit('operator:status', { available: false });
+          }
+        }
+      }, 5000); // 5 second grace period for reconnect
     }
     
-    // Client disconnect
+    // Client disconnect with grace period
     if (socket.clientId) {
-      activeClients.delete(socket.clientId);
-      io.to('operators').emit('client:left', { id: socket.clientId });
+      console.log(`Client ${socket.clientId} socket disconnected, starting grace period`);
+      const client = activeClients.get(socket.clientId);
+      
+      if (client && client.socket === socket.id) {
+        // Don't delete, just mark as disconnected and notify operators
+        activeClients.set(socket.clientId, {
+          ...client,
+          status: 'disconnected',
+          disconnectedAt: new Date().toISOString()
+        });
+        
+        // Notify operators about temporary disconnect
+        io.to('operators').emit('client:updated', { 
+          id: socket.clientId,
+          status: 'disconnected',
+          hasOperator: !!client.operatorId
+        });
+        
+        // Set timeout to remove client if not reconnected
+        setTimeout(() => {
+          const currentClient = activeClients.get(socket.clientId);
+          if (currentClient && currentClient.status === 'disconnected') {
+            console.log(`Removing client ${socket.clientId} after grace period`);
+            activeClients.delete(socket.clientId);
+            io.to('operators').emit('client:left', { id: socket.clientId });
+          }
+        }, 30000); // 30 seconds grace period
+      }
+    }
+  });
+
+  // Unified reconnect:attempt handler
+  socket.on('reconnect:attempt', ({ clientId, operatorId, name }) => {
+    console.log(`Reconnection attempt - clientId: ${clientId}, operatorId: ${operatorId}`);
+    
+    if (clientId) {
+      // Client reconnecting
+      socket.clientId = clientId;
+      socket.clientName = name;
+      socket.join('clients');
+      
+      // Check if this client exists
+      const existingClient = activeClients.get(clientId);
+      if (existingClient) {
+        // Store previous socket ID to detect if this is really a new connection
+        const previousSocketId = existingClient.socket;
+        
+        // Only update if this is a new socket ID
+        if (previousSocketId !== socket.id) {
+          console.log(`Client ${clientId} reconnected with new socket ID: ${socket.id} (previous: ${previousSocketId})`);
+          
+          // Update client record with new socket ID
+          activeClients.set(clientId, { 
+            ...existingClient,
+            socket: socket.id,
+            name: name || existingClient.name,
+            status: 'connected',
+            reconnectedAt: new Date().toISOString()
+          });
+          
+          // Notify operators about reconnection - only when socket truly changed
+          io.to('operators').emit('client:reconnected', {
+            id: clientId,
+            name: name || existingClient.name,
+            hasOperator: !!existingClient.operatorId,
+            status: 'connected'
+          });
+          
+          // If client had an operator, restore the connection
+          if (existingClient.operatorId) {
+            console.log(`Restoring operator ${existingClient.operatorId} for client ${clientId}`);
+            
+            // Send exactly once to just this client
+            socket.emit('chat:accepted', { 
+              operatorId: existingClient.operatorId,
+              restored: true // Add flag to indicate this is a restored connection
+            });
+            
+            // Notify operator about successful reconnection
+            io.to('operators').emit('message:system', {
+              clientId,
+              text: 'Client has reconnected and can continue chatting',
+              timestamp: new Date().toISOString()
+            });
+          }
+        } else {
+          console.log(`Client ${clientId} reconnected but socket ID is unchanged: ${socket.id}`);
+        }
+        
+        // Always confirm successful reconnection to client
+        socket.emit('reconnect:success', {
+          operatorId: existingClient.operatorId,
+          status: 'connected',
+          socketId: socket.id
+        });
+      } else {
+        // Client is completely new, register with client:connect instead
+        console.log(`Client ${clientId} not found during reconnect, treating as new client`);
+        socket.emit('use:client:connect');
+      }
+    } else if (operatorId) {
+      // Operator reconnecting
+      socket.operatorId = operatorId;
+      socket.operatorName = name;
+      socket.join('operators');
+      activeOperators.add(operatorId);
+      
+      // Inform clients that an operator is available
+      io.to('clients').emit('operator:status', { available: true });
     }
   });
 });
