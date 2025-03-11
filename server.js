@@ -72,12 +72,16 @@ io.on('connection', (socket) => {
     socket.operatorId = operatorId;
     socket.operatorName = operatorName;
     
-    // Inform the operator about current active clients
-    socket.emit('clients:list', Array.from(activeClients.entries()).map(([id, client]) => ({
+    // Inform the operator about current active clients with unique IDs only
+    const uniqueClients = Array.from(activeClients.entries()).map(([id, client]) => ({
       id,
-      name: client.name,
-      hasOperator: !!client.operatorId
-    })));
+      name: client.name || 'Guest',
+      hasOperator: !!client.operatorId,
+      status: client.status || 'connected'
+    }));
+    
+    console.log('Sending unique clients list to operator:', uniqueClients.map(c => c.id));
+    socket.emit('clients:list', uniqueClients);
     
     // Broadcast to all clients that an operator is available
     socket.broadcast.emit('operator:status', { available: true });
@@ -88,6 +92,9 @@ io.on('connection', (socket) => {
     const clientId = clientData.id || socket.id;
     const clientName = clientData.name || 'Guest';
     console.log(`Client connected: ${clientId} (${clientName})`);
+    
+    // Add logging to debug duplicate clients
+    console.log('Current active clients before update:', Array.from(activeClients.keys()));
     
     socket.join('clients');
     socket.clientId = clientId;
@@ -119,6 +126,9 @@ io.on('connection', (socket) => {
       if (existingClient.operatorId) {
         io.to(socket.id).emit('chat:accepted', { operatorId: existingClient.operatorId });
       }
+      
+      // Enhanced debugging log
+      console.log(`Client ${clientId} reconnected. Updated active clients:`, Array.from(activeClients.keys()));
     } else {
       // Register new client
       activeClients.set(clientId, { 
@@ -129,13 +139,15 @@ io.on('connection', (socket) => {
         connectedAt: new Date().toISOString()
       });
       
-      // Notify operators about the new client
+      // Notify operators about the new client, ensuring unique ID
       io.to('operators').emit('client:new', { 
         id: clientId,
         name: clientName,
         hasOperator: false,
         status: 'connected'
       });
+      
+      console.log(`New client ${clientId} added. Updated active clients:`, Array.from(activeClients.keys()));
     }
     
     // Let the client know if operators are available
