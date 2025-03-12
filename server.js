@@ -124,7 +124,20 @@ io.on('connection', (socket) => {
       
       // If client had an operator, re-establish the connection
       if (existingClient.operatorId) {
-        io.to(socket.id).emit('chat:accepted', { operatorId: existingClient.operatorId });
+        console.log(`Restoring operator ${existingClient.operatorId} for client ${clientId}`);
+        io.to(socket.id).emit('chat:accepted', { 
+          operatorId: existingClient.operatorId,
+          restored: true // Add flag to indicate this is a restored connection
+        });
+        
+        // Important: Also notify operators about this client being reconnected
+        io.to('operators').emit('client:updated', {
+          id: clientId,
+          name: clientName,
+          hasOperator: true,
+          status: 'connected',
+          reconnected: true
+        });
       }
       
       // Enhanced debugging log
@@ -154,6 +167,22 @@ io.on('connection', (socket) => {
     socket.emit('operator:status', { available: activeOperators.size > 0 });
   });
   
+  // Replace the problematic code removing the client:reconnect handler
+  // PROBLEM: socket.off('client:reconnect') is trying to remove an undefined listener
+  
+  // Instead of this:
+  // socket.off('client:reconnect'); // Remove any existing handler
+
+  // Do this - remove ALL listeners for this event, which is safer:
+  socket.removeAllListeners('client:reconnect');
+  
+  // For backward compatibility, add a simple redirection for old client:reconnect usage
+  socket.on('client:reconnect', (clientData) => {
+    console.log('Legacy client:reconnect received, redirecting to client:connect');
+    // Use the proper handling method - emit to the client:connect handler on this socket
+    socket.emit('client:connect', clientData);
+  });
+
   // Client leaves chat explicitly
   socket.on('client:leave', ({ clientId }) => {
     console.log(`Client ${clientId} explicitly left the chat`);
@@ -335,6 +364,10 @@ io.on('connection', (socket) => {
       timestamp: new Date().toISOString()
     };
     
+    // Generate a new clientId for the client's next session
+    const newClientId = `${clientId}_new_${Date.now()}`;
+    console.log(`Generated new client ID for next session: ${newClientId}`);
+    
     // Notify ALL operators to ensure everyone knows this chat has ended
     io.to('operators').emit('chat:ended', endEventPayload);
     
@@ -348,9 +381,17 @@ io.on('connection', (socket) => {
     
     // Notify client if they're still connected
     if (client.socket) {
+      // First send the chat:ended event
       io.to(client.socket).emit('chat:ended', {
         ...endEventPayload,
         message: endedBy === 'operator' ? 'The operator has ended this chat session' : 'You ended the chat session'
+      });
+      
+      // Then send the new client ID for their next session
+      io.to(client.socket).emit('chat:assign_new_id', {
+        oldId: clientId,
+        newId: newClientId,
+        timestamp: new Date().toISOString()
       });
     }
   });
