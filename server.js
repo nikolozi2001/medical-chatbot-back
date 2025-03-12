@@ -251,11 +251,18 @@ io.on('connection', (socket) => {
         console.log(`Client ${to} not found`);
         socket.emit('error', { 
           message: 'Client not found or no longer connected',
-          clientId: to
+          clientId: to,
+          status: 'disconnected' // Added status field for better error handling
         });
+        
+        // ACK the message with error
+        if (messageId && typeof ack === 'function') {
+          ack({ success: false, error: 'Client not found' });
+        }
+        
         return;
       }
-      
+
       // IMPROVED CHAT ENDED CHECK - Log more details for debugging
       console.log(`Checking if chat ended for client ${to}: chatEnded=${client.chatEnded}, endedBy=${client.endedBy || 'unknown'}`);
       
@@ -280,6 +287,7 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Add ACK support for messages
       if (client && client.socket) {
         console.log(`Sending message from operator ${socket.operatorId} to client ${to}`);
         
@@ -294,12 +302,23 @@ io.on('connection', (socket) => {
           type,
           timestamp: new Date().toISOString()
         });
+
+        // If we have an ACK function, call it with success
+        if (messageId && typeof ack === 'function') {
+          ack({ success: true });
+        }
       } else {
         // Client not found or disconnected
         socket.emit('error', { 
           message: 'Client disconnected or not found',
-          clientId: to
+          clientId: to,
+          status: 'disconnected' // Added status field for better error handling
         });
+        
+        // ACK the message with error
+        if (messageId && typeof ack === 'function') {
+          ack({ success: false, error: 'Client disconnected' });
+        }
       }
     }
     // From client to operator
