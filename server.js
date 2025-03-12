@@ -216,6 +216,41 @@ io.on('connection', (socket) => {
     // From operator to client
     if (socket.operatorId && to) {
       const client = activeClients.get(to);
+      
+      // Client not found check
+      if (!client) {
+        console.log(`Client ${to} not found`);
+        socket.emit('error', { 
+          message: 'Client not found or no longer connected',
+          clientId: to
+        });
+        return;
+      }
+      
+      // IMPROVED CHAT ENDED CHECK - Log more details for debugging
+      console.log(`Checking if chat ended for client ${to}: chatEnded=${client.chatEnded}, endedBy=${client.endedBy || 'unknown'}`);
+      
+      // Check for chatEnded explicitly with strict equality
+      if (client.chatEnded === true) {
+        console.log(`BLOCKED: Message to ended chat with client ${to}`);
+        
+        // Send detailed error and ensure chat:ended event is sent again
+        socket.emit('error', { 
+          message: 'Cannot send message: Chat has ended',
+          clientId: to,
+          chatEndedAt: client.endedAt || new Date().toISOString()
+        });
+        
+        // Re-emit chat:ended event to force operator client state to update
+        socket.emit('chat:ended', {
+          clientId: to,
+          endedBy: client.endedBy || 'client',
+          message: 'This chat has already ended',
+          timestamp: client.endedAt || new Date().toISOString()
+        });
+        return;
+      }
+
       if (client && client.socket) {
         console.log(`Sending message from operator ${socket.operatorId} to client ${to}`);
         
@@ -256,6 +291,67 @@ io.on('connection', (socket) => {
         // No operator assigned
         socket.emit('error', { message: 'No operator assigned to this chat yet' });
       }
+    }
+  });
+  
+  // Update the chat:end event handling to be more robust
+  socket.on('chat:end', ({ clientId, operatorId, endedBy }) => {
+    console.log(`Chat ended - clientId: ${clientId}, operatorId: ${operatorId}, endedBy: ${endedBy}`);
+    
+    // Validate input parameters
+    if (!clientId) {
+      console.error("Missing clientId in chat:end event");
+      return;
+    }
+    
+    const client = activeClients.get(clientId);
+    if (!client) {
+      console.error(`Client ${clientId} not found for chat:end event`);
+      return;
+    }
+    
+    // Get the existing operator ID if not provided
+    const effectiveOperatorId = operatorId || client.operatorId;
+    
+    // Update client state regardless of who ended the chat
+    activeClients.set(clientId, {
+      ...client,
+      operatorId: null, // Remove operator assignment
+      chatEnded: true,  // Explicitly mark as ended
+      endedBy: endedBy || 'unknown',
+      endedAt: new Date().toISOString()
+    });
+    
+    // Log chat ended state
+    const updatedClient = activeClients.get(clientId);
+    console.log(`Client ${clientId} chat marked as ended: chatEnded=${updatedClient.chatEnded}, endedBy=${updatedClient.endedBy}`);
+    
+    // Create a chat:ended event payload
+    const endEventPayload = {
+      clientId,
+      operatorId: effectiveOperatorId,
+      endedBy: endedBy || 'unknown',
+      message: `Chat ended by ${endedBy || 'unknown'}`,
+      timestamp: new Date().toISOString()
+    };
+    
+    // Notify ALL operators to ensure everyone knows this chat has ended
+    io.to('operators').emit('chat:ended', endEventPayload);
+    
+    // Update operators about client status
+    io.to('operators').emit('client:updated', {
+      id: clientId,
+      hasOperator: false,
+      status: 'available',
+      chatEnded: true
+    });
+    
+    // Notify client if they're still connected
+    if (client.socket) {
+      io.to(client.socket).emit('chat:ended', {
+        ...endEventPayload,
+        message: endedBy === 'operator' ? 'The operator has ended this chat session' : 'You ended the chat session'
+      });
     }
   });
   
