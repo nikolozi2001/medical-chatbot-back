@@ -5,6 +5,7 @@ const app = express();
 const http = require('http');
 const server = http.createServer(app);
 const { Server } = require("socket.io");
+const mongoose = require('mongoose');
 
 // Configure CORS for the entire application
 app.use(cors({
@@ -14,6 +15,40 @@ app.use(cors({
 
 app.use(express.json());
 require("dotenv").config();
+
+// Replace the current MongoDB connection with Atlas connection
+// const uri = "mongodb+srv://medicalbot:General126@cluster0.rh1sg.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
+const uri = process.env.MONGODB_URI;
+const clientOptions = { 
+  serverApi: { version: '1', strict: true, deprecationErrors: true },
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+};
+
+// Connect to MongoDB
+mongoose.connect(uri, clientOptions)
+  .then(() => console.log('MongoDB Atlas connected successfully'))
+  .catch(err => console.error('MongoDB connection error:', err));
+
+// Add event listeners for connection status
+mongoose.connection.on('connected', () => {
+  console.log('Mongoose connected to MongoDB Atlas');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('Mongoose connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('Mongoose disconnected from MongoDB Atlas');
+});
+
+// Graceful shutdown - close MongoDB connection when app terminates
+process.on('SIGINT', async () => {
+  await mongoose.connection.close();
+  console.log('MongoDB connection closed through app termination');
+  process.exit(0);
+});
 
 // Configure Socket.IO with proper CORS settings
 const io = new Server(server, {
@@ -167,13 +202,7 @@ io.on('connection', (socket) => {
     socket.emit('operator:status', { available: activeOperators.size > 0 });
   });
   
-  // Replace the problematic code removing the client:reconnect handler
-  // PROBLEM: socket.off('client:reconnect') is trying to remove an undefined listener
-  
-  // Instead of this:
-  // socket.off('client:reconnect'); // Remove any existing handler
-
-  // Do this - remove ALL listeners for this event, which is safer:
+  // Remove ALL listeners for this event, which is safer
   socket.removeAllListeners('client:reconnect');
   
   // For backward compatibility, add a simple redirection for old client:reconnect usage
@@ -549,31 +578,73 @@ io.on('connection', (socket) => {
   });
 });
 
+// API Routes
 app.get("/", (req, res) => {
   res.send("Medical Chatbot API is running!");
 });
 
+// Import and use routes
+const chatSessionRoutes = require('./routes/chatSessions');
+app.use('/api/chat-sessions', chatSessionRoutes);
+
+// Update the chat endpoint to store messages in MongoDB
 app.post("/chat", async (req, res) => {
   try {
     console.log("Received /chat request with body:", req.body);
 
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
+    
     const chat = model.startChat({
       history: req.body.history,
     });
-
+    
     const msg = req.body.message;
-
+    const sessionId = req.body.sessionId;
+    
     const result = await chat.sendMessage(msg);
-    console.log("Result object:", result);
-
     const response = await result.response;
-    console.log("Response object:", response);
-
     const text = response.candidates[0].content.parts.map(part => part.text).join(" ");
-    console.log("Generated response text:", text);
-
+    
+    // Store in MongoDB
+    const ChatSession = require('./models/chatSession');
+    
+    // Check if this session already exists
+    let session = await ChatSession.findOne({ sessionId: sessionId });
+    
+    if (!session) {
+      // Create new session
+      session = new ChatSession({
+        sessionId: sessionId,
+        messages: [
+          {
+            type: 'user',
+            message: msg,
+            timestamp: new Date()
+          },
+          {
+            type: 'bot',
+            message: text,
+            timestamp: new Date()
+          }
+        ]
+      });
+    } else {
+      // Add to existing session
+      session.messages.push({
+        type: 'user',
+        message: msg,
+        timestamp: new Date()
+      });
+      
+      session.messages.push({
+        type: 'bot',
+        message: text,
+        timestamp: new Date()
+      });
+    }
+    
+    await session.save();
+    
     res.json({ text });
   } catch (error) {
     console.error("Error handling /chat request:", error);
