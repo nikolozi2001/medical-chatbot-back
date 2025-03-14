@@ -35,6 +35,16 @@ const operatorSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now
+  },
+  // Add these fields for password reset
+  resetPasswordToken: String,
+  resetPasswordExpires: Date,
+  
+  // Add these fields for TOTP authentication
+  totpSecret: String,
+  isTotpEnabled: {
+    type: Boolean,
+    default: false
   }
 });
 
