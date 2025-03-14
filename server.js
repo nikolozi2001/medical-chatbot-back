@@ -587,6 +587,10 @@ app.get("/", (req, res) => {
 const chatSessionRoutes = require('./routes/chatSessions');
 app.use('/api/chat-sessions', chatSessionRoutes);
 
+// Add the new operators routes
+const operatorRoutes = require('./routes/operators');
+app.use('/api/operators', operatorRoutes);
+
 // Update the chat endpoint to store messages in MongoDB
 app.post("/chat", async (req, res) => {
   try {
