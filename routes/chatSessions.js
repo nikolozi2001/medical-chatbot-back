@@ -35,6 +35,7 @@ router.post('/', async (req, res) => {
     date: req.body.date || new Date(),
     messages: req.body.messages || [],
     userId: req.body.userId || 'anonymous',
+    clientName: req.body.clientName || 'Anonymous',
     userAgent: req.headers['user-agent'],
     metadata: req.body.metadata || {}
   });

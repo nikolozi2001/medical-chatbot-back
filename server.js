@@ -604,6 +604,7 @@ app.post("/chat", async (req, res) => {
     
     const msg = req.body.message;
     const sessionId = req.body.sessionId;
+    const clientName = req.body.clientName || 'Anonymous'; // Extract client name from request
     
     const result = await chat.sendMessage(msg);
     const response = await result.response;
@@ -616,9 +617,10 @@ app.post("/chat", async (req, res) => {
     let session = await ChatSession.findOne({ sessionId: sessionId });
     
     if (!session) {
-      // Create new session
+      // Create new session with client name
       session = new ChatSession({
         sessionId: sessionId,
+        clientName: clientName, // Store the client name
         messages: [
           {
             type: 'user',
@@ -633,6 +635,11 @@ app.post("/chat", async (req, res) => {
         ]
       });
     } else {
+      // Update existing session's client name if not already set
+      if (!session.clientName) {
+        session.clientName = clientName;
+      }
+      
       // Add to existing session
       session.messages.push({
         type: 'user',
